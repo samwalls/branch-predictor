@@ -1,0 +1,6 @@
+# ignore PIN tool build ouptut
+obj-intel64/
+
+# ignore branchtrace data output
+branchtrace.out
+pin.log
