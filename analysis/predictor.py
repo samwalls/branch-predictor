@@ -162,11 +162,17 @@ class ProfilerPredictor(Predictor):
         super(ProfilerPredictor, self).__init__(data=data)
         self._addr_bits = addr_bits
         self._probability = {}
+        if data is not None:
+            self._base_addr = data['target'].min()
+        else:
+            self._base_addr = 0
 
     def _addr(self, row):
         # use subset of address to consolidate samples
         mask = (2 ** self._addr_bits) - 1
-        return row['target'] & mask
+        # make address relative to base address
+        # (the intuition for this is to generalise one training run across to other runs)
+        return (row['target'] - self._base_addr) & mask
 
     def train(self, _training_data):
         training_data = _training_data.copy()
@@ -189,6 +195,50 @@ class ProfilerPredictor(Predictor):
     def predict_all(self):
         for i, row in self.data.iterrows():
             p = self._probability[self._addr(row)]
+            prediction_n = np.random.choice(np.arange(0, 2), p=[1 - p, p])
+            prediction = prediction_n == 1 and True or False
+            self.data.at[i, 'predict_taken'] = prediction
+            self.data.at[i, 'predict_correct'] = row['taken'] == prediction
+        return self.data
+
+
+class NgramProfilerPredictor(ProfilerPredictor):
+
+    def __init__(self, data=None, addr_bits=8, n=1):
+        # n = 1 by default, meaning that by default this will perform the same as the base ProfilerPredictor
+        super(NgramProfilerPredictor, self).__init__(data=data, addr_bits=addr_bits)
+        self._n = n
+
+    def train(self, _training_data):
+        training_data = _training_data.copy()
+        frequency = {}
+        totals = {}
+        probability = {}
+        # create empty tuple of n elements
+        ngram = ((),) * self._n
+        for i, row in training_data.iterrows():
+            ngram = ngram + (self._addr(row), )
+            # take a tuple of the last n elements after adding an element
+            ngram = ngram[-self._n:]
+            if ngram not in frequency.keys():
+                frequency[ngram] = 0
+                totals[ngram] = 0
+            totals[ngram] = totals[ngram] + 1
+            # add to taken frequency if the branch was taken
+            if row['taken']:
+                frequency[ngram] = frequency[ngram] + 1
+        for addr, freq in frequency.items():
+            probability[addr] = frequency[addr] / totals[addr]
+        self._probability = probability
+
+    def predict_all(self):
+        ngram = ((),) * self._n
+        for i, row in self.data.iterrows():
+            ngram = ngram + (self._addr(row),)
+            # take a tuple of the last n elements after adding an element
+            ngram = ngram[-self._n:]
+            # get probability of this ngram resulting in a taken branch
+            p = self._probability[ngram]
             prediction_n = np.random.choice(np.arange(0, 2), p=[1 - p, p])
             prediction = prediction_n == 1 and True or False
             self.data.at[i, 'predict_taken'] = prediction
