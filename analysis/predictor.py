@@ -1,15 +1,64 @@
 from abc import ABC, abstractmethod
+import matplotlib.pyplot as plt
 import pandas as pd
 import numpy as np
 
 
 # COMMON UTILITY FUNCTIONS
 
-
 def import_data(path):
     data = pd.read_csv(path, sep='\s+', header=None, names=['target', 'taken'])
     data['taken'] = data['taken'] == 1
     return data
+
+
+# MEASUREMENT AND TESTING
+
+
+def run_all(test_set):
+    results = pd.DataFrame()
+    accuracy = {}
+    for name, predictor in test_set.items():
+        print("running prediction for", name)
+        results[name] = predictor.predict_all()['predict_correct']
+        accuracy[name] = predictor.analyse_total_accuracy()
+    accuracy_table = pd.DataFrame(data=list(accuracy.items()), columns=['name', 'accuracy'])
+    accuracy_table.set_index('name')
+    return results, accuracy_table
+
+
+def run_plot_compare(test_set=None, name=None, rolling_window=1):
+    results, accuracy = run_all(test_set)
+
+    plt.rcParams.update({'font.size': 8})
+
+    fig1, ax1 = plt.subplots(dpi=100)
+    accuracy.plot(
+        kind='bar',
+        ylim=(0.0, 1.0),
+        title='Average Comparison' + (name is not None and ': ' + name or ''),
+        ax=ax1,
+        y='accuracy',
+        legend=False,
+        figsize=(3, 3)
+    )
+    ax1.set_xlabel('method')
+    ax1.set_ylabel('total accuracy')
+
+    fig2, ax2 = plt.subplots(dpi=150)
+    results.astype(float).rolling(rolling_window).mean().plot(
+        linewidth=1,
+        ylim=(0.0, 1.0),
+        title='Instantaneous Comparison' + (name is not None and ': ' + name or ''),
+        ax=ax2,
+        figsize=(8, 5)
+    )
+    ax2.set_xlabel('branch number')
+    ax2.set_ylabel('rolling mean correct predictions')
+
+    return results, accuracy, fig1, fig2
+
+# BRANCH PREDICTOR CLASSES
 
 
 class SaturatingCounter(object):
@@ -166,31 +215,37 @@ class ProfilerPredictor(Predictor):
             self._base_addr = data['target'].min()
         else:
             self._base_addr = 0
+        self._frequency = {}
+        self._totals = {}
+        self._probability = {}
+        self.clear()
 
-    def _addr(self, row):
+    def clear(self):
+        self._frequency = {}
+        self._totals = {}
+        self._probability = {}
+
+    def _addr(self, row, base_addr=None):
         # use subset of address to consolidate samples
         mask = (2 ** self._addr_bits) - 1
         # make address relative to base address
         # (the intuition for this is to generalise one training run across to other runs)
-        return (row['target'] - self._base_addr) & mask
+        return (row['target'] - (base_addr is None and self._base_addr or base_addr)) & mask
 
     def train(self, _training_data):
         training_data = _training_data.copy()
-        frequency = {}
-        totals = {}
-        probability = {}
         for i, row in training_data.iterrows():
             addr = self._addr(row)
-            if addr not in frequency.keys():
-                frequency[addr] = 0
-                totals[addr] = 0
-            totals[addr] = totals[addr] + 1
+            if addr not in self._frequency.keys():
+                self._frequency[addr] = 0
+                self._totals[addr] = 0
+            self._totals[addr] = self._totals[addr] + 1
             # add to taken frequency if the branch was taken
             if row['taken']:
-                frequency[addr] = frequency[addr] + 1
-        for addr, freq in frequency.items():
-            probability[addr] = frequency[addr] / totals[addr]
-        self._probability = probability
+                self._frequency[addr] = self._frequency[addr] + 1
+        for addr, freq in self._frequency.items():
+            self._probability[addr] = self._frequency[addr] / self._totals[addr]
+        return self
 
     def predict_all(self):
         for i, row in self.data.iterrows():
@@ -204,32 +259,32 @@ class ProfilerPredictor(Predictor):
 
 class NgramProfilerPredictor(ProfilerPredictor):
 
-    def __init__(self, data=None, addr_bits=8, n=1):
+    def __init__(self, data=None, addr_bits=8, n=1, default_take_probability=0.5):
         # n = 1 by default, meaning that by default this will perform the same as the base ProfilerPredictor
         super(NgramProfilerPredictor, self).__init__(data=data, addr_bits=addr_bits)
         self._n = n
+        # the probability of a taken branch if there exists no key in the probability table
+        self._default_take_probability = default_take_probability
 
     def train(self, _training_data):
         training_data = _training_data.copy()
-        frequency = {}
-        totals = {}
-        probability = {}
+        base_addr = training_data['target'].min()
         # create empty tuple of n elements
         ngram = ((),) * self._n
         for i, row in training_data.iterrows():
             ngram = ngram + (self._addr(row), )
             # take a tuple of the last n elements after adding an element
             ngram = ngram[-self._n:]
-            if ngram not in frequency.keys():
-                frequency[ngram] = 0
-                totals[ngram] = 0
-            totals[ngram] = totals[ngram] + 1
+            if ngram not in self._frequency.keys():
+                self._frequency[ngram] = 0
+                self._totals[ngram] = 0
+            self._totals[ngram] = self._totals[ngram] + 1
             # add to taken frequency if the branch was taken
             if row['taken']:
-                frequency[ngram] = frequency[ngram] + 1
-        for addr, freq in frequency.items():
-            probability[addr] = frequency[addr] / totals[addr]
-        self._probability = probability
+                self._frequency[ngram] = self._frequency[ngram] + 1
+        for addr, freq in self._frequency.items():
+            self._probability[addr] = self._frequency[addr] / self._totals[addr]
+        return self
 
     def predict_all(self):
         ngram = ((),) * self._n
@@ -238,7 +293,11 @@ class NgramProfilerPredictor(ProfilerPredictor):
             # take a tuple of the last n elements after adding an element
             ngram = ngram[-self._n:]
             # get probability of this ngram resulting in a taken branch
-            p = self._probability[ngram]
+            if ngram in self._probability.keys():
+                p = self._probability[ngram]
+            else:
+                # TODO this value is arbitrary, what else could be done?
+                p = self._default_take_probability
             prediction_n = np.random.choice(np.arange(0, 2), p=[1 - p, p])
             prediction = prediction_n == 1 and True or False
             self.data.at[i, 'predict_taken'] = prediction
